@@ -628,7 +628,7 @@ const calcRound = function () {
 }();
 
 ;// ./web/internal_evt.js
-const INTERNAL_EVT = "6620ce58-866b-48e2-a3ae-22242fa99766";
+const INTERNAL_EVT = "2a31f3ed-7196-4dbb-ada9-d120c8855410";
 const internalOpt = Object.freeze({
   internal: INTERNAL_EVT
 });
@@ -4266,6 +4266,661 @@ function isDestArraysEqual(firstDest, secondDest) {
   return true;
 }
 
+;// ./web/renderable_view.js
+const RenderingStates = {
+  INITIAL: 0,
+  RUNNING: 1,
+  PAUSED: 2,
+  FINISHED: 3
+};
+class RenderableView {
+  renderingId = "";
+  renderTask = null;
+  resume = null;
+  get renderingState() {
+    throw new Error("Abstract getter `renderingState` accessed");
+  }
+  set renderingState(state) {
+    throw new Error("Abstract setter `renderingState` accessed");
+  }
+  async draw() {
+    throw new Error("Not implemented: draw");
+  }
+}
+
+;// ./web/pdf_jump_history.js
+
+
+
+const DEFAULT_MAX_ENTRIES = 5;
+const MAX_ENTRIES_CHOICES = [1, 2, 3, 4, 5];
+const MAX_ENTRIES_STORAGE_KEY = "pdfjs.jumpHistoryMaxEntries";
+const MARK_MARGIN = 24;
+const SAME_LINE_DISTANCE = 2;
+const MAX_TEXT_LENGTH = 80;
+const FLASH_DURATION = 1600;
+class PDFJumpHistory {
+  #marks = [];
+  #markIndex = -1;
+  #returnPosition = null;
+  #currentLocation = null;
+  #enabled = false;
+  #maxEntries = DEFAULT_MAX_ENTRIES;
+  #store = null;
+  #filename = "document.pdf";
+  #panelAbortController = null;
+  #clearTimeout = null;
+  constructor({
+    container,
+    backButton,
+    listButton,
+    panel,
+    entries,
+    saveButton,
+    maxEntriesSelect,
+    clearButton
+  }, eventBus, pdfViewer) {
+    this.container = container;
+    this.backButton = backButton;
+    this.listButton = listButton;
+    this.panel = panel;
+    this.entries = entries;
+    this.eventBus = eventBus;
+    this.pdfViewer = pdfViewer;
+    backButton.addEventListener("click", () => this.toggleReturn());
+    listButton.addEventListener("click", () => this.togglePanel());
+    saveButton.addEventListener("click", () => this.saveToFile());
+    clearButton.addEventListener("click", () => {
+      if (this.#clearTimeout) {
+        this.#resetClearButton(clearButton);
+        this.clearAll();
+        return;
+      }
+      clearButton.classList.add("confirm");
+      clearButton.setAttribute("data-l10n-id", "pdfjs-jump-history-clear-button-confirm");
+      this.#clearTimeout = setTimeout(() => this.#resetClearButton(clearButton), 3000);
+    });
+    this.clearButton = clearButton;
+    eventBus.on("annotationeditoruimanager", ({
+      uiManager
+    }) => {
+      uiManager.addFloatingToolbarButton({
+        className: "jumpHistoryMarkButton",
+        l10nId: "pdfjs-jump-history-mark-floating-button",
+        labelL10nId: "pdfjs-jump-history-mark-floating-button-label",
+        onClick: () => this.markSelection()
+      });
+      uiManager.addFloatingToolbarButton({
+        className: "jumpHistoryListButton",
+        l10nId: "pdfjs-jump-history-list-floating-button",
+        labelL10nId: "pdfjs-jump-history-list-floating-button-label",
+        onClick: () => {
+          document.getSelection()?.removeAllRanges();
+          this.openPanel();
+        }
+      });
+    }, internalOpt);
+    try {
+      const stored = parseInt(localStorage.getItem(MAX_ENTRIES_STORAGE_KEY), 10);
+      if (MAX_ENTRIES_CHOICES.includes(stored)) {
+        this.#maxEntries = stored;
+      }
+    } catch {}
+    maxEntriesSelect.replaceChildren(...MAX_ENTRIES_CHOICES.map(n => new Option(n, n)));
+    maxEntriesSelect.value = this.#maxEntries;
+    maxEntriesSelect.addEventListener("change", () => this.setMaxEntries(parseInt(maxEntriesSelect.value, 10)));
+    eventBus.on("updateviewarea", ({
+      location
+    }) => {
+      this.#currentLocation = location;
+    }, internalOpt);
+    eventBus.on("beforenavigate", this.#onBeforeNavigate.bind(this), internalOpt);
+    eventBus.on("pagerendered", ({
+      pageNumber
+    }) => this.#renderHighlights(pageNumber), internalOpt);
+    this.#render();
+  }
+  async initialize(store, filename) {
+    this.#enabled = true;
+    this.#store = store;
+    this.#filename = filename || "document.pdf";
+    this.#render();
+    if (!store) {
+      return;
+    }
+    try {
+      const {
+        jumpHistoryMarks,
+        jumpHistory,
+        jumpHistoryForward,
+        jumpHistoryMark
+      } = await store.getMultiple({
+        jumpHistoryMarks: null,
+        jumpHistory: null,
+        jumpHistoryForward: null,
+        jumpHistoryMark: null
+      });
+      if (this.#store !== store) {
+        return;
+      }
+      const stored = Array.isArray(jumpHistoryMarks) ? jumpHistoryMarks : [...(Array.isArray(jumpHistory) ? jumpHistory : []), ...(Array.isArray(jumpHistoryForward) ? jumpHistoryForward.toReversed() : []), jumpHistoryMark].filter(pos => pos?.marked);
+      const pagesCount = this.pdfViewer.pagesCount;
+      const marks = stored.filter(pos => Number.isInteger(pos?.pageNumber) && pos.pageNumber >= 1 && pos.pageNumber <= pagesCount).map(pos => this.#toPosition(pos));
+      this.#marks.unshift(...marks);
+      this.#markIndex = this.#marks.length ? this.#marks.length - 1 : -1;
+      this.#trim();
+      this.#render();
+    } catch {}
+  }
+  reset() {
+    this.#marks.length = 0;
+    this.#markIndex = -1;
+    this.#returnPosition = null;
+    this.#currentLocation = null;
+    this.#enabled = false;
+    this.#store = null;
+    this.closePanel();
+    this.#resetClearButton(this.clearButton);
+    this.#render();
+  }
+  get canReturn() {
+    return !!this.#returnPosition;
+  }
+  get hasMarks() {
+    return this.#marks.length > 0;
+  }
+  get maxEntries() {
+    return this.#maxEntries;
+  }
+  setMaxEntries(value) {
+    if (!MAX_ENTRIES_CHOICES.includes(value)) {
+      return;
+    }
+    this.#maxEntries = value;
+    try {
+      localStorage.setItem(MAX_ENTRIES_STORAGE_KEY, value);
+    } catch {}
+    this.#trim();
+    this.#render();
+    this.#save();
+  }
+  get isPanelOpen() {
+    return !this.panel.hidden;
+  }
+  toggleReturn() {
+    const target = this.#returnPosition;
+    if (!target) {
+      return;
+    }
+    const location = this.#currentLocation;
+    this.#returnPosition = location ? this.#toPosition(location) : null;
+    this.#goTo(target);
+    this.#render();
+    this.#flash(target);
+  }
+  cycleBack() {
+    const count = this.#marks.length;
+    if (count) {
+      this.#goToMark(this.#markIndex < 0 ? count - 1 : (this.#markIndex - 1 + count) % count);
+    }
+  }
+  cycleForward() {
+    const count = this.#marks.length;
+    if (count) {
+      this.#goToMark((this.#markIndex + 1) % count);
+    }
+  }
+  #goToMark(index) {
+    const mark = this.#marks[index];
+    if (!mark) {
+      return;
+    }
+    this.#markIndex = index;
+    this.#goTo(mark);
+    this.#render();
+    this.#flash(mark);
+  }
+  #toPosition({
+    pageNumber,
+    left,
+    top,
+    text,
+    textTop,
+    textLeft,
+    line
+  }) {
+    const position = {
+      pageNumber,
+      left: Math.round(left),
+      top: Math.round(top),
+      text: text ?? null,
+      line: line ?? null
+    };
+    if (position.text === null || position.line === null) {
+      const ready = this.#getLine(pageNumber, textTop ?? top, textLeft ?? null).then(({
+        text: lineText,
+        line: lineRect
+      }) => {
+        position.text ??= lineText;
+        position.line = lineRect;
+        this.#render();
+        this.#save();
+      });
+      Object.defineProperty(position, "ready", {
+        value: ready
+      });
+    }
+    return position;
+  }
+  async #getLine(pageNumber, top, x = null) {
+    try {
+      const page = await this.pdfViewer.pdfDocument.getPage(pageNumber);
+      const {
+        items
+      } = await page.getTextContent();
+      const isAtX = ({
+        transform,
+        width
+      }) => x === null || transform[4] <= x + 1 && transform[4] + width >= x - 1;
+      let lineY = -Infinity,
+        lineHeight = 10;
+      for (const item of items) {
+        const y = item.transform[5];
+        const length = item.str.trim().length;
+        if (length > (x === null ? 1 : 0) && y <= top && y > lineY && isAtX(item)) {
+          lineY = y;
+          lineHeight = item.height || 10;
+        }
+      }
+      const nearbyItems = items.filter(({
+        transform,
+        width
+      }) => width > 0 && Math.abs(transform[5] - lineY) < 8 * lineHeight);
+      const minX = Math.floor(Math.min(...nearbyItems.map(({
+        transform
+      }) => transform[4])));
+      const maxX = Math.ceil(Math.max(...nearbyItems.map(i => i.transform[4] + i.width)));
+      const coverage = new Uint16Array(Math.max(maxX - minX + 1, 1));
+      for (const {
+        transform,
+        width
+      } of nearbyItems) {
+        const from = Math.floor(transform[4]) - minX;
+        const to = Math.ceil(transform[4] + width) - minX;
+        for (let i = from; i < to; i++) {
+          coverage[i]++;
+        }
+      }
+      const startX = x ?? Math.min(...items.filter(({
+        transform
+      }) => Math.abs(transform[5] - lineY) < 2).map(({
+        transform
+      }) => transform[4]));
+      const at = MathClamp(Math.round(startX) - minX, 0, maxX - minX);
+      const threshold = 0.4 * coverage[at];
+      let colStart = at,
+        colEnd = at;
+      while (colStart > 0 && coverage[colStart - 1] > threshold) {
+        colStart--;
+      }
+      while (colEnd < maxX - minX && coverage[colEnd + 1] > threshold) {
+        colEnd++;
+      }
+      colStart += minX;
+      colEnd += minX;
+      const lineRun = items.filter(({
+        str,
+        transform,
+        width
+      }) => {
+        const dy = transform[5] - lineY;
+        const middle = transform[4] + width / 2;
+        return middle >= colStart - 1 && middle <= colEnd + 1 && (Math.abs(dy) < 2 || str.trim() && dy > -0.6 * lineHeight && dy < 0.8 * lineHeight);
+      }).sort((a, b) => a.transform[4] - b.transform[4]);
+      const parts = [];
+      let x1 = Infinity,
+        y1 = Infinity,
+        x2 = -Infinity,
+        y2 = -Infinity;
+      for (const {
+        str,
+        transform,
+        width,
+        height
+      } of lineRun) {
+        parts.push(str);
+        const h = height || lineHeight;
+        x1 = Math.min(x1, transform[4]);
+        x2 = Math.max(x2, transform[4] + width);
+        y1 = Math.min(y1, transform[5] - 0.3 * h);
+        y2 = Math.max(y2, transform[5] + 0.95 * h);
+      }
+      const text = parts.join(" ").replaceAll(/\s+/g, " ").trim();
+      const line = parts.length ? [x1 - 2, y1, x2 + 2, y2].map(Math.round) : undefined;
+      return {
+        text: text.length > MAX_TEXT_LENGTH ? `${text.slice(0, MAX_TEXT_LENGTH - 1)}…` : text,
+        line
+      };
+    } catch {
+      return {
+        text: "",
+        line: undefined
+      };
+    }
+  }
+  #drawLine(position, className) {
+    const pageView = this.pdfViewer.getPageView(position.pageNumber - 1);
+    if (!position.line || !pageView?.div) {
+      return null;
+    }
+    const {
+      viewport
+    } = pageView;
+    const [px1, py1, px2, py2] = position.line;
+    const [x1, y1] = viewport.convertToViewportPoint(px1, py1);
+    const [x2, y2] = viewport.convertToViewportPoint(px2, py2);
+    const div = document.createElement("div");
+    div.className = className;
+    div.setAttribute("aria-hidden", "true");
+    const {
+      width,
+      height
+    } = viewport;
+    Object.assign(div.style, {
+      left: `${100 * Math.min(x1, x2) / width}%`,
+      top: `${100 * Math.min(y1, y2) / height}%`,
+      width: `${100 * Math.abs(x2 - x1) / width}%`,
+      height: `${100 * Math.abs(y2 - y1) / height}%`
+    });
+    pageView.div.append(div);
+    return div;
+  }
+  #renderHighlights(pageNumber = 0) {
+    const selector = pageNumber ? `.page[data-page-number="${pageNumber}"] .jumpHistoryHighlight` : ".jumpHistoryHighlight";
+    for (const div of this.pdfViewer.viewer.querySelectorAll(selector)) {
+      div.remove();
+    }
+    if (!this.#enabled) {
+      return;
+    }
+    for (const mark of this.#marks) {
+      if (!pageNumber || mark.pageNumber === pageNumber) {
+        this.#drawLine(mark, "jumpHistoryHighlight");
+      }
+    }
+  }
+  async #flash(position) {
+    await position.ready;
+    await new Promise(resolve => {
+      setTimeout(resolve, 50);
+    });
+    const pageView = this.pdfViewer.getPageView(position.pageNumber - 1);
+    if (pageView && pageView.renderingState !== RenderingStates.FINISHED) {
+      await new Promise(resolve => {
+        const ac = new AbortController();
+        const done = () => {
+          ac.abort();
+          resolve();
+        };
+        this.eventBus.on("pagerendered", evt => evt.pageNumber === position.pageNumber && done(), {
+          signal: ac.signal,
+          ...internalOpt
+        });
+        setTimeout(done, 2000);
+      });
+    }
+    const div = this.#drawLine(position, "jumpHistoryFlash");
+    if (div) {
+      setTimeout(() => div.remove(), FLASH_DURATION);
+    }
+  }
+  togglePanel() {
+    if (this.isPanelOpen) {
+      this.closePanel();
+    } else {
+      this.openPanel();
+    }
+  }
+  openPanel() {
+    if (this.isPanelOpen || this.container.hidden) {
+      return;
+    }
+    this.panel.hidden = false;
+    this.listButton.setAttribute("aria-expanded", "true");
+    this.#renderPanel();
+    this.#panelAbortController = new AbortController();
+    const {
+      signal
+    } = this.#panelAbortController;
+    window.addEventListener("pointerdown", evt => {
+      if (!this.panel.contains(evt.target) && !this.listButton.contains(evt.target)) {
+        this.closePanel();
+      }
+    }, {
+      signal
+    });
+    window.addEventListener("keydown", evt => {
+      if (evt.key === "Escape") {
+        this.closePanel();
+        this.listButton.focus();
+        evt.preventDefault();
+        evt.stopPropagation();
+      }
+    }, {
+      signal,
+      capture: true
+    });
+    this.panel.querySelector("[aria-current] button, button")?.focus();
+  }
+  #resetClearButton(button) {
+    clearTimeout(this.#clearTimeout);
+    this.#clearTimeout = null;
+    button.classList.remove("confirm");
+    button.setAttribute("data-l10n-id", "pdfjs-jump-history-clear-button");
+  }
+  closePanel() {
+    this.#panelAbortController?.abort();
+    this.#panelAbortController = null;
+    this.panel.hidden = true;
+    this.listButton.setAttribute("aria-expanded", "false");
+  }
+  #renderPanel() {
+    if (!this.isPanelOpen) {
+      return;
+    }
+    if (!this.#marks.length) {
+      const li = document.createElement("li");
+      li.className = "empty";
+      li.setAttribute("data-l10n-id", "pdfjs-jump-history-entry-empty");
+      this.entries.replaceChildren(li);
+      return;
+    }
+    const items = this.#marks.map((mark, index) => {
+      const li = document.createElement("li");
+      if (index === this.#markIndex) {
+        li.setAttribute("aria-current", "true");
+      }
+      const button = document.createElement("button");
+      button.type = "button";
+      const page = document.createElement("span");
+      page.className = "jumpHistoryEntryPage";
+      page.setAttribute("data-l10n-id", "pdfjs-jump-history-entry-page");
+      page.setAttribute("data-l10n-args", JSON.stringify({
+        page: mark.pageNumber
+      }));
+      const text = document.createElement("span");
+      text.className = "jumpHistoryEntryText";
+      if (mark.text) {
+        text.textContent = mark.text;
+      } else {
+        text.setAttribute("data-l10n-id", mark.text === null ? "pdfjs-jump-history-entry-loading" : "pdfjs-jump-history-entry-no-text");
+      }
+      button.append(page, text);
+      button.addEventListener("click", () => {
+        this.closePanel();
+        this.#goToMark(index);
+      });
+      li.append(button);
+      return li;
+    });
+    this.entries.replaceChildren(...items);
+  }
+  saveToFile() {
+    const marks = this.#marks.map((mark, i) => ({
+      order: i + 1,
+      page: mark.pageNumber,
+      left: mark.left,
+      top: mark.top,
+      text: mark.text || ""
+    }));
+    const data = {
+      document: this.#filename,
+      fingerprint: this.pdfViewer.pdfDocument?.fingerprints[0] ?? null,
+      savedAt: new Date().toISOString(),
+      marks
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], {
+      type: "application/json"
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${this.#filename.replace(/\.pdf$/i, "")}-marks.json`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+  #goTo({
+    pageNumber,
+    left,
+    top
+  }) {
+    this.pdfViewer.scrollPageIntoView({
+      pageNumber,
+      destArray: [null, {
+        name: "XYZ"
+      }, left, top, null],
+      allowNegativeOffset: true,
+      ignoreDestinationZoom: true
+    });
+    this.pdfViewer.focus();
+  }
+  markCurrentPosition() {
+    const location = this.#currentLocation;
+    if (location) {
+      this.#addMark({
+        ...location,
+        text: null
+      });
+    }
+  }
+  markAt(pageNumber, top, textTop, textLeft = null) {
+    const location = this.#currentLocation;
+    if (!location || !Number.isInteger(pageNumber)) {
+      return;
+    }
+    const pageTop = this.pdfViewer.getPageView(pageNumber - 1)?.pdfPage?.view[3] ?? Infinity;
+    this.#addMark({
+      pageNumber,
+      left: location.left,
+      top: Math.min(top + MARK_MARGIN, pageTop),
+      textTop,
+      textLeft,
+      text: null
+    });
+  }
+  #addMark(location) {
+    const mark = this.#toPosition(location);
+    this.#marks = this.#marks.filter(({
+      pageNumber,
+      top
+    }) => pageNumber !== mark.pageNumber || Math.abs(top - mark.top) > SAME_LINE_DISTANCE);
+    this.#marks.push(mark);
+    this.#markIndex = this.#marks.length - 1;
+    this.#trim();
+    this.#render();
+    this.#save();
+    this.#flash(mark);
+  }
+  markSelection() {
+    const selection = document.getSelection();
+    if (!selection || selection.isCollapsed) {
+      return;
+    }
+    const range = selection.getRangeAt(0);
+    const node = range.startContainer;
+    const pageDiv = (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement)?.closest(".page");
+    const rect = [...range.getClientRects()].find(r => r.width && r.height);
+    if (!pageDiv || !rect) {
+      return;
+    }
+    const pageNumber = parseInt(pageDiv.getAttribute("data-page-number"), 10);
+    const pageView = this.pdfViewer.getPageView(pageNumber - 1);
+    if (!pageView) {
+      return;
+    }
+    const {
+      div
+    } = pageView;
+    const pageRect = div.getBoundingClientRect();
+    const originX = pageRect.left + div.clientLeft,
+      originY = pageRect.top + div.clientTop;
+    const [, top] = pageView.getPagePoint(rect.left - originX, rect.top - originY);
+    const [left, middle] = pageView.getPagePoint(rect.left + 2 - originX, rect.top + rect.height / 2 - originY);
+    selection.removeAllRanges();
+    this.markAt(pageNumber, top, middle, left);
+  }
+  clearAll() {
+    this.#marks.length = 0;
+    this.#markIndex = -1;
+    this.#render();
+    this.#save();
+  }
+  #onBeforeNavigate() {
+    if (!this.#enabled) {
+      return;
+    }
+    const location = this.#currentLocation;
+    if (location) {
+      this.#returnPosition = this.#toPosition(location);
+      this.#render();
+    }
+  }
+  #trim() {
+    const excess = this.#marks.length - this.#maxEntries;
+    if (excess > 0) {
+      this.#marks.splice(0, excess);
+      this.#markIndex = Math.max(this.#markIndex - excess, -1);
+    }
+  }
+  #save() {
+    this.#store?.setMultiple({
+      jumpHistoryMarks: this.#marks
+    }).catch(() => {});
+  }
+  #render() {
+    const target = this.#returnPosition;
+    this.container.hidden = !this.#enabled;
+    if (this.container.hidden) {
+      this.closePanel();
+    }
+    this.#renderPanel();
+    this.#renderHighlights();
+    this.backButton.disabled = !target;
+    this.backButton.querySelector(".jumpHistoryPage").textContent = target?.pageNumber ?? "";
+    if (target) {
+      this.backButton.setAttribute("data-l10n-id", "pdfjs-jump-history-back-button");
+      this.backButton.setAttribute("data-l10n-args", JSON.stringify({
+        page: target.pageNumber
+      }));
+    } else {
+      this.backButton.setAttribute("data-l10n-id", "pdfjs-jump-history-back-button-empty");
+      this.backButton.removeAttribute("data-l10n-args");
+    }
+  }
+}
+
 ;// ./web/annotation_editor_layer_builder.js
 
 
@@ -4901,28 +5556,6 @@ class Autolinker {
         borderStyle: null
       };
     });
-  }
-}
-
-;// ./web/renderable_view.js
-const RenderingStates = {
-  INITIAL: 0,
-  RUNNING: 1,
-  PAUSED: 2,
-  FINISHED: 3
-};
-class RenderableView {
-  renderingId = "";
-  renderTask = null;
-  resume = null;
-  get renderingState() {
-    throw new Error("Abstract getter `renderingState` accessed");
-  }
-  set renderingState(state) {
-    throw new Error("Abstract setter `renderingState` accessed");
-  }
-  async draw() {
-    throw new Error("Not implemented: draw");
   }
 }
 
@@ -9864,6 +10497,7 @@ class PDFSinglePageViewer extends PDFViewer {
 
 
 
+
 globalThis.pdfjsViewer = {
   AnnotationLayerBuilder: AnnotationLayerBuilder,
   DownloadManager: DownloadManager,
@@ -9874,6 +10508,7 @@ globalThis.pdfjsViewer = {
   parseQueryString: parseQueryString,
   PDFFindController: PDFFindController,
   PDFHistory: PDFHistory,
+  PDFJumpHistory: PDFJumpHistory,
   PDFLinkService: PDFLinkService,
   PDFPageView: PDFPageView,
   PDFScriptingManager: PDFScriptingManagerComponents,
@@ -9889,6 +10524,6 @@ globalThis.pdfjsViewer = {
   XfaLayerBuilder: XfaLayerBuilder
 };
 
-export { AnnotationLayerBuilder, DownloadManager, EventBus, FindState, genericl10n_GenericL10n as GenericL10n, LinkTarget, PDFFindController, PDFHistory, PDFLinkService, PDFPageView, PDFScriptingManagerComponents as PDFScriptingManager, PDFSinglePageViewer, PDFViewer, ProgressBar, RenderingStates, ScrollMode, SimpleLinkService, SpreadMode, StructTreeLayerBuilder, TextLayerBuilder, XfaLayerBuilder, parseQueryString };
+export { AnnotationLayerBuilder, DownloadManager, EventBus, FindState, genericl10n_GenericL10n as GenericL10n, LinkTarget, PDFFindController, PDFHistory, PDFJumpHistory, PDFLinkService, PDFPageView, PDFScriptingManagerComponents as PDFScriptingManager, PDFSinglePageViewer, PDFViewer, ProgressBar, RenderingStates, ScrollMode, SimpleLinkService, SpreadMode, StructTreeLayerBuilder, TextLayerBuilder, XfaLayerBuilder, parseQueryString };
 
 //# sourceMappingURL=pdf_viewer.mjs.map
